@@ -1,0 +1,8 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "financial-management",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "ai": { "binding": "AI" },
+  "observability": { "enabled": true }
+}
