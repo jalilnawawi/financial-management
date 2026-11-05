@@ -1,5 +1,5 @@
 import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
-import { parseTx, type TxType } from "./parse";
+import { parseTx, type TxInput, type TxType } from "./parse";
 
 type Sql = NeonQueryFunction<false, false>;
 type Row = Record<string, any>;
@@ -7,21 +7,42 @@ type Message = { chat: { id: number }; from?: { id: number }; text?: string };
 
 const AI_MODEL = "@cf/meta/llama-3.1-8b-instruct-fp8-fast";
 
-const HELP = `Perintah:
-/keluar nominal, item, sumber[, jenis][, catatan]
-  jenis: harian (default) | bulanan | tahunan
-  contoh: /keluar 25rb, kopi, BCA
-/masuk nominal, item, sumber[, catatan]
-  contoh: /masuk 5jt, gaji, BCA
-/edit id nominal, item, sumber[, jenis][, catatan]
-/hapus id
-/harian [YYYY-MM-DD]  transaksi + total hari itu
-/bulanan [YYYY-MM]    report bulanan + analisa AI
-/sumber               daftar sumber dana + saldo
-/sumber tambah nama`;
+// Pemisah antar field = koma. Tanpa kurung.
+const USAGE: Record<string, string> = {
+  "/keluar": `/keluar nominal, item, sumber, jenis, catatan
+  jenis: harian | bulanan | tahunan (opsional, default harian)
+  catatan: opsional
+  contoh:
+  /keluar 25rb, kopi, Cash
+  /keluar 28rb, Martabak Manis, Cash, harian, jenguk mbah yamin
+  /keluar 150rb, internet, BCA, bulanan`,
+  "/masuk": `/masuk nominal, item, sumber, catatan
+  catatan: opsional
+  contoh:
+  /masuk 5jt, gaji, BCA
+  /masuk 750rb, side-job, Cash, desain logo`,
+  "/edit": `/edit id nominal, item, sumber, jenis, catatan
+  semua field ditulis ulang, format sama dengan /keluar atau /masuk
+  contoh:
+  /edit 1 28rb, Martabak Manis, Cash, harian, jenguk mbah yamin`,
+  "/hapus": `/hapus id
+  contoh: /hapus 1`,
+  "/harian": `/harian [YYYY-MM-DD]  transaksi + total hari itu
+  contoh: /harian atau /harian 2026-11-05`,
+  "/bulanan": `/bulanan [YYYY-MM]  report bulanan + analisa AI
+  contoh: /bulanan atau /bulanan 2026-10`,
+  "/sumber": `/sumber  daftar sumber dana + saldo
+/sumber tambah nama
+  contoh: /sumber tambah BCA`,
+};
+const HELP = "Perintah:\n\n" + Object.values(USAGE).join("\n\n");
 
 const rp = (n: number | string) => "Rp" + Number(n).toLocaleString("id-ID");
-const notFound = (sumber: string) => `Sumber dana "${sumber}" tidak ada. Tambah dulu: /sumber tambah ${sumber}`;
+const notFound = (sumber: string, cmd: string) =>
+  `Sumber dana "${sumber}" tidak ada. Tambah dulu: /sumber tambah ${sumber}\n\n${USAGE[cmd]}`;
+// Bentuk input yang bisa langsung di-copy untuk /edit
+const asInput = (tx: TxInput) =>
+  [tx.amount, tx.item, tx.sumber, tx.expenseType?.toLowerCase(), tx.note].filter(Boolean).join(", ");
 
 export default {
   async fetch(req, env): Promise<Response> {
@@ -58,23 +79,23 @@ async function handle(sql: Sql, env: Env, userId: string, input: string): Promis
     case "/masuk": {
       const type: TxType = cmd === "/keluar" ? "PENGELUARAN" : "PEMASUKAN";
       const tx = parseTx(args, type);
-      if (typeof tx === "string") return tx;
+      if (typeof tx === "string") return `${tx}\n\n${USAGE[cmd]}`;
       const [row] = await sql`
         insert into transactions (item_name, amount, transaction_type, expense_type, sumber_dana_id, note, created_by)
         select ${tx.item}, ${tx.amount}, ${type}, ${tx.expenseType}, s.id, ${tx.note}, ${userId}
         from sumber_dana s where lower(s.name) = lower(${tx.sumber})
         returning id`;
-      if (!row) return notFound(tx.sumber);
-      return `Tercatat #${row.id}: ${type} ${rp(tx.amount)} ${tx.item} (${tx.sumber}${tx.expenseType ? ", " + tx.expenseType : ""})`;
+      if (!row) return notFound(tx.sumber, cmd);
+      return `Tercatat #${row.id}: ${type} ${rp(tx.amount)} ${tx.item}\nUbah: /edit ${row.id} ${asInput(tx)}\nHapus: /hapus ${row.id}`;
     }
 
     case "/edit": {
       const m = args.match(/^#?(\d+)\s+([\s\S]+)$/);
-      if (!m) return "Format: /edit id nominal, item, sumber[, jenis][, catatan]";
+      if (!m) return USAGE[cmd];
       const [old] = await sql`select transaction_type from transactions where id = ${m[1]}`;
       if (!old) return `Transaksi #${m[1]} tidak ditemukan.`;
       const tx = parseTx(m[2], old.transaction_type);
-      if (typeof tx === "string") return tx;
+      if (typeof tx === "string") return `${tx}\n\n${USAGE[cmd]}`;
       const [row] = await sql`
         update transactions t set
           item_name = ${tx.item}, amount = ${tx.amount}, expense_type = ${tx.expenseType},
@@ -82,13 +103,13 @@ async function handle(sql: Sql, env: Env, userId: string, input: string): Promis
         from sumber_dana s
         where t.id = ${m[1]} and lower(s.name) = lower(${tx.sumber})
         returning t.id`;
-      if (!row) return notFound(tx.sumber);
-      return `Transaksi #${row.id} diupdate: ${rp(tx.amount)} ${tx.item} (${tx.sumber})`;
+      if (!row) return notFound(tx.sumber, cmd);
+      return `Transaksi #${row.id} diupdate: ${rp(tx.amount)} ${tx.item}\nUbah lagi: /edit ${row.id} ${asInput(tx)}`;
     }
 
     case "/hapus": {
       const id = args.replace("#", "");
-      if (!/^\d+$/.test(id)) return "Format: /hapus id";
+      if (!/^\d+$/.test(id)) return USAGE[cmd];
       const [row] = await sql`delete from transactions where id = ${id} returning id, item_name, amount`;
       return row ? `Transaksi #${row.id} dihapus: ${rp(row.amount)} ${row.item_name}` : `Transaksi #${id} tidak ditemukan.`;
     }
